@@ -1,0 +1,45 @@
+name: Build Santroller Configurator (Windows)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'configurator/**'
+      - 'proto/**'
+      - '.github/workflows/build-configurator.yml'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: configurator
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: configurator/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows executables & installer
+        run: npm run build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Santroller-Configurator-Windows-x64
+          path: |
+            configurator/dist-electron/*.exe
+            configurator/dist-electron/*.zip
+          if-no-files-found: error
