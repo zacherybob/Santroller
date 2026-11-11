@@ -9,6 +9,9 @@ on:
       - '.github/workflows/build-configurator.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -43,3 +46,9 @@ jobs:
             configurator/dist-electron/*.exe
             configurator/dist-electron/*.zip
           if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        run: |
+          gh release upload v1.0.0-configurator dist-electron/*.exe dist-electron/*.zip --clobber || gh release create v1.0.0-configurator dist-electron/*.exe dist-electron/*.zip --title "Santroller Configurator v1.0.0 (Windows x64)" --notes "Standalone Windows x64 Portable executable and ZIP distribution for the Santroller Configurator desktop application."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
