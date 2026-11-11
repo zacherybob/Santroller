@@ -1,0 +1,38 @@
+{
+  "name": "santroller-configurator",
+  "version": "1.0.0",
+  "description": "Configuration tool for Santroller rhythm game controller firmware",
+  "main": "electron-main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "proto:gen": "pbjs -t static-module -w es6 -o src/proto/proto.js ../proto/enums.proto ../proto/input_enums.proto ../proto/input.proto ../proto/device.proto ../proto/events.proto ../proto/commands.proto ../proto/config.proto && pbts -o src/proto/proto.d.ts src/proto/proto.js",
+    "electron:dev": "vite --port 5173",
+    "electron:pack": "vite build && electron-builder"
+  },
+  "keywords": ["santroller", "rhythm-games", "firmware", "guitar-hero", "rock-band", "rp2040"],
+  "author": "",
+  "license": "GPL-3.0",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "electron": "^45.3.0",
+    "electron-builder": "^26.18.0",
+    "lucide-react": "^1.71.0",
+    "protobufjs": "^8.8.1",
+    "protobufjs-cli": "^2.7.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.7"
+  },
+  "dependencies": {
+    "autoprefixer": "^10.6.2",
+    "clsx": "^2.1.1",
+    "postcss": "^8.5.32",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwindcss": "^3.4.19"
+  }
+}
