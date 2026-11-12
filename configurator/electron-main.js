@@ -1,5 +1,89 @@
-const { app, BrowserWindow, session } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+
+// Crucial Chromium flags for WebHID permissions and controller collection access
+app.commandLine.appendSwitch('disable-hid-blocklist');
+app.commandLine.appendSwitch('enable-experimental-web-platform-features');
+
+let HID;
+try {
+  HID = require('node-hid');
+  console.log('node-hid loaded successfully');
+} catch (e) {
+  console.warn('node-hid not available, falling back to WebHID only:', e.message);
+}
+
+// Active device handle map for node-hid
+const openDevices = new Map();
+
+function setupNodeHidIpc(win) {
+  ipcMain.handle('node-hid-status', async () => {
+    return { available: !!HID };
+  });
+
+  ipcMain.handle('node-hid-list', async () => {
+    if (!HID) return [];
+    try {
+      const all = HID.devices();
+      return all;
+    } catch (e) {
+      console.error('node-hid list error:', e);
+      return [];
+    }
+  });
+
+  ipcMain.handle('node-hid-open', async (event, devicePath) => {
+    if (!HID) throw new Error('Native HID not supported on this platform');
+    try {
+      if (openDevices.has(devicePath)) {
+        try { openDevices.get(devicePath).close(); } catch {}
+      }
+      const dev = new HID.HID(devicePath);
+      openDevices.set(devicePath, dev);
+
+      dev.on('data', (data) => {
+        if (!win.isDestroyed()) {
+          win.webContents.send('node-hid-data', {
+            path: devicePath,
+            data: Array.from(data)
+          });
+        }
+      });
+
+      dev.on('error', (err) => {
+        console.error('node-hid device error:', err);
+      });
+
+      return true;
+    } catch (e) {
+      console.error('node-hid open failed:', e);
+      throw e;
+    }
+  });
+
+  ipcMain.handle('node-hid-close', async (event, devicePath) => {
+    if (openDevices.has(devicePath)) {
+      try {
+        openDevices.get(devicePath).close();
+      } catch {}
+      openDevices.delete(devicePath);
+    }
+    return true;
+  });
+
+  ipcMain.handle('node-hid-send-feature-report', async (event, { path: devicePath, data }) => {
+    const dev = openDevices.get(devicePath);
+    if (!dev) throw new Error('Device not open');
+    return dev.sendFeatureReport(Buffer.from(data));
+  });
+
+  ipcMain.handle('node-hid-receive-feature-report', async (event, { path: devicePath, reportId, length }) => {
+    const dev = openDevices.get(devicePath);
+    if (!dev) throw new Error('Device not open');
+    const buf = dev.getFeatureReport(reportId, length || 64);
+    return Array.from(buf);
+  });
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -15,40 +99,36 @@ function createWindow() {
     },
   });
 
+  setupNodeHidIpc(win);
+
   const ses = win.webContents.session;
 
-  // 1. Grant WebHID permissions
-  ses.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
-    return true;
-  });
+  // Grant WebHID permissions
+  ses.setPermissionCheckHandler(() => true);
+  ses.setDevicePermissionHandler(() => true);
 
-  ses.setDevicePermissionHandler((details) => {
-    return true;
-  });
-
-  // 2. Critical for Electron WebHID: automatically select the device when requested
-  // or return the matched Santroller device when navigator.hid.requestDevice() is called
+  // WebHID automatic & manual device selection
   ses.on('select-hid-device', (event, details, callback) => {
     event.preventDefault();
 
     if (details.deviceList && details.deviceList.length > 0) {
-      // Find Santroller or Pi Pico device by VID/PID or usagePage
       const santrollerDevice = details.deviceList.find(d => 
-        (d.vendorId === 0x1209 && (d.productId === 0x2882 || d.productId === 0x2883)) ||
-        d.vendorId === 0x046d ||
-        d.collections?.some(c => c.usagePage === 0xFF00 || c.usagePage === 65280) ||
-        (d.productName && d.productName.toLowerCase().includes('santroller'))
+        (d.vendorId === 0x1209) ||
+        (d.vendorId === 0x2e8a) || // Raspberry Pi Pico
+        (d.vendorId === 0x046d) ||
+        (d.vendorId === 0x12ba) ||
+        (d.vendorId === 0x045e) ||
+        (d.collections && d.collections.some(c => c.usagePage === 0xFF00 || c.usagePage === 65280)) ||
+        (d.productName && /santroller|rp2040|pico|guitar|drum|controller/i.test(d.productName))
       );
 
       if (santrollerDevice) {
         callback(santrollerDevice.deviceId);
-      } else {
-        // Fall back to first available device in list
-        callback(details.deviceList[0].deviceId);
+        return;
       }
-    } else {
-      callback('');
     }
+    // Never pick an unknown device (e.g. mouse/keyboard) blindly
+    callback('');
   });
 
   const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
@@ -71,6 +151,10 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  for (const dev of openDevices.values()) {
+    try { dev.close(); } catch {}
+  }
+  openDevices.clear();
   if (process.platform !== 'darwin') {
     app.quit();
   }

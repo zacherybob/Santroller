@@ -24,12 +24,147 @@ export enum ReportId {
 export type EventCallback = (event: proto.IEvent) => void;
 export type LogCallback = (line: string) => void;
 
+interface GenericHidDevice {
+  productName: string;
+  vendorId: number;
+  productId: number;
+  opened: boolean;
+  open(): Promise<void>;
+  close(): Promise<void>;
+  sendFeatureReport(reportId: number, data: Uint8Array): Promise<void>;
+  receiveFeatureReport(reportId: number, length?: number): Promise<DataView>;
+  addEventListener(event: string, handler: (e: any) => void): void;
+}
+
+/**
+ * Native Node-HID wrapper when running in Electron
+ */
+class NodeHidDeviceWrapper implements GenericHidDevice {
+  public productName: string;
+  public vendorId: number;
+  public productId: number;
+  public opened: boolean = false;
+  private path: string;
+  private ipcRenderer: any;
+  private reportListeners: ((e: any) => void)[] = [];
+
+  constructor(info: any, ipc: any) {
+    this.productName = info.product || 'Santroller RP2040 Device';
+    this.vendorId = info.vendorId;
+    this.productId = info.productId;
+    this.path = info.path;
+    this.ipcRenderer = ipc;
+
+    this.ipcRenderer.on('node-hid-data', (event: any, msg: any) => {
+      if (msg.path === this.path) {
+        const u8 = new Uint8Array(msg.data);
+        for (const l of this.reportListeners) {
+          l({ data: new DataView(u8.buffer) });
+        }
+      }
+    });
+  }
+
+  async open(): Promise<void> {
+    await this.ipcRenderer.invoke('node-hid-open', this.path);
+    this.opened = true;
+  }
+
+  async close(): Promise<void> {
+    if (this.opened) {
+      await this.ipcRenderer.invoke('node-hid-close', this.path);
+      this.opened = false;
+    }
+  }
+
+  async sendFeatureReport(reportId: number, data: Uint8Array): Promise<void> {
+    // node-hid expects reportId as the first byte of data
+    let payload: number[];
+    if (data[0] === reportId) {
+      payload = Array.from(data);
+    } else {
+      payload = [reportId, ...Array.from(data)];
+    }
+    await this.ipcRenderer.invoke('node-hid-send-feature-report', {
+      path: this.path,
+      data: payload
+    });
+  }
+
+  async receiveFeatureReport(reportId: number, length: number = 64): Promise<DataView> {
+    const res: number[] = await this.ipcRenderer.invoke('node-hid-receive-feature-report', {
+      path: this.path,
+      reportId,
+      length
+    });
+    const u8 = new Uint8Array(res);
+    return new DataView(u8.buffer);
+  }
+
+  addEventListener(event: string, handler: (e: any) => void) {
+    if (event === 'inputreport') {
+      this.reportListeners.push(handler);
+    }
+  }
+}
+
+/**
+ * WebHID device adapter to conform to GenericHidDevice interface
+ */
+class WebHidDeviceWrapper implements GenericHidDevice {
+  public productName: string;
+  public vendorId: number;
+  public productId: number;
+  public opened: boolean;
+  private dev: any;
+
+  constructor(dev: any) {
+    this.dev = dev;
+    this.productName = dev.productName || 'Santroller Device';
+    this.vendorId = dev.vendorId;
+    this.productId = dev.productId;
+    this.opened = dev.opened;
+  }
+
+  async open(): Promise<void> {
+    if (!this.dev.opened) {
+      await this.dev.open();
+    }
+    this.opened = this.dev.opened;
+  }
+
+  async close(): Promise<void> {
+    if (this.dev.opened) {
+      await this.dev.close();
+    }
+    this.opened = false;
+  }
+
+  async sendFeatureReport(reportId: number, data: Uint8Array): Promise<void> {
+    // If the data already contains reportId as byte 0, pass data directly or slice
+    let payload = data;
+    if (data.length > 0 && data[0] === reportId) {
+      payload = data.subarray(1);
+    }
+    await this.dev.sendFeatureReport(reportId, payload);
+  }
+
+  async receiveFeatureReport(reportId: number): Promise<DataView> {
+    const res = await this.dev.receiveFeatureReport(reportId);
+    return res;
+  }
+
+  addEventListener(event: string, handler: (e: any) => void) {
+    this.dev.addEventListener(event, handler);
+  }
+}
+
 /**
  * SantrollerDeviceConnection manages communication with a Santroller device
- * via WebHID or through a Mock/Simulator backend.
+ * via native OS node-hid in Electron, WebHID in browsers, or offline Simulator.
  */
 export class SantrollerDeviceConnection {
-  private hidDevice: any = null;
+  private device: GenericHidDevice | null = null;
   private isSimulator: boolean = false;
   private keepaliveTimer: any = null;
   private onEventCallbacks: EventCallback[] = [];
@@ -41,7 +176,6 @@ export class SantrollerDeviceConnection {
 
   constructor() {
     this.createDefaultConfig();
-    this.listenDeviceChanges();
   }
 
   public isConnected(): boolean {
@@ -88,93 +222,213 @@ export class SantrollerDeviceConnection {
     }
   }
 
-  private listenDeviceChanges() {
-    if (typeof navigator !== 'undefined' && 'hid' in navigator) {
-      (navigator as any).hid.addEventListener('disconnect', (e: any) => {
-        if (this.hidDevice === e.device) {
-          this.emitLog(`Device disconnected: ${e.device?.productName || 'Santroller'}`);
-          this.disconnect();
+  /**
+   * Enumerate all detected USB HID devices across native node-hid and WebHID
+   */
+  public async listDevices(): Promise<any[]> {
+    const results: any[] = [];
+    if (typeof window !== 'undefined' && (window as any).require) {
+      try {
+        const { ipcRenderer } = (window as any).require('electron');
+        if (ipcRenderer) {
+          const list = await ipcRenderer.invoke('node-hid-list');
+          for (const d of list) {
+            results.push({
+              source: 'native',
+              path: d.path,
+              vendorId: d.vendorId,
+              productId: d.productId,
+              productName: d.product || 'USB HID Device',
+              manufacturer: d.manufacturer || '',
+              usagePage: d.usagePage,
+              usage: d.usage,
+              isSantroller: (d.vendorId === 0x1209) ||
+                (d.vendorId === 0x2e8a) ||
+                (d.usagePage === 0xFF00 || d.usagePage === 65280) ||
+                /santroller|rp2040|pico|guitar|drum|gamepad/i.test(d.product || '')
+            });
+          }
         }
-      });
+      } catch (err: any) {
+        console.warn('Native listDevices error:', err);
+      }
     }
+
+    if (typeof navigator !== 'undefined' && 'hid' in navigator) {
+      try {
+        const webDevices = await (navigator as any).hid.getDevices();
+        for (const wd of webDevices) {
+          results.push({
+            source: 'webhid',
+            raw: wd,
+            vendorId: wd.vendorId,
+            productId: wd.productId,
+            productName: wd.productName || 'WebHID Device',
+            collections: wd.collections,
+            isSantroller: (wd.vendorId === 0x1209) ||
+              (wd.vendorId === 0x2e8a) ||
+              (wd.collections && wd.collections.some((c: any) => c.usagePage === 0xFF00 || c.usagePage === 65280)) ||
+              /santroller|rp2040|pico|guitar|drum|gamepad/i.test(wd.productName || '')
+          });
+        }
+      } catch (err: any) {
+        console.warn('WebHID listDevices error:', err);
+      }
+    }
+    return results;
   }
 
   /**
-   * Connect via WebHID (Available in Chrome / Edge / Electron)
+   * Connect to a specific chosen device
    */
-  public async connectWebHID(): Promise<boolean> {
-    try {
-      if (!('hid' in navigator)) {
-        throw new Error('WebHID is not supported in this environment.');
+  public async connectToDevice(target: any): Promise<boolean> {
+    this.disconnect();
+    this.emitLog(`Connecting to selected device: ${target.productName} (VID: 0x${target.vendorId?.toString(16)}, PID: 0x${target.productId?.toString(16)})`);
+    if (target.source === 'native') {
+      const { ipcRenderer } = (window as any).require('electron');
+      const nodeDev = new NodeHidDeviceWrapper(target, ipcRenderer);
+      await nodeDev.open();
+      this.device = nodeDev;
+      return await this.setupDeviceConnection();
+    } else if (target.source === 'webhid' && target.raw) {
+      const webDev = new WebHidDeviceWrapper(target.raw);
+      await webDev.open();
+      this.device = webDev;
+      return await this.setupDeviceConnection();
+    }
+    return false;
+  }
+
+  /**
+   * Primary auto-connection method:
+   * First tries Native Node-HID (bypasses Windows OS WebHID exclusive block on controllers),
+   * then falls back to WebHID.
+   */
+  public async connectHardware(): Promise<boolean> {
+    this.emitLog('Scanning for connected Santroller devices...');
+
+    // 1. Try Native Electron Node-HID IPC first (Windows-proof)
+    if (typeof window !== 'undefined' && (window as any).require) {
+      try {
+        const { ipcRenderer } = (window as any).require('electron');
+        if (ipcRenderer) {
+          const deviceList: any[] = await ipcRenderer.invoke('node-hid-list');
+          this.emitLog(`Found ${deviceList.length} USB HID device(s) on system via Native driver.`);
+
+          // Filter for Santroller RP2040 / RP2350
+          const match = deviceList.find(d =>
+            (d.vendorId === 0x1209 && (d.productId === 0x2882 || d.productId === 0x2883)) ||
+            (d.vendorId === 0x2e8a) || // Raspberry Pi Pico
+            (d.usagePage === 0xFF00 || d.usagePage === 65280) ||
+            (d.product && /santroller|rp2040|pico|guitar|drum/i.test(d.product))
+          );
+
+          if (match) {
+            this.emitLog(`Found Santroller via Native HID: ${match.product || 'Santroller'} (VID: 0x${match.vendorId.toString(16)}, PID: 0x${match.productId.toString(16)})`);
+            const nodeDev = new NodeHidDeviceWrapper(match, ipcRenderer);
+            await nodeDev.open();
+            this.device = nodeDev;
+            return await this.setupDeviceConnection();
+          }
+        }
+      } catch (err: any) {
+        this.emitLog(`Native HID scan skipped: ${err.message}`);
       }
+    }
 
-      this.emitLog('Scanning for connected Santroller devices...');
+    // 2. Fall back to standard WebHID
+    return await this.connectWebHID();
+  }
 
-      // Filters matching official Santroller firmware VIDs, PIDs and Vendor UsagePage
-      const filters = [
-        { vendorId: 0x1209, productId: 0x2882, usagePage: 0xFF00 },
-        { vendorId: 0x1209, productId: 0x2883, usagePage: 0xFF00 },
-        { vendorId: 0x1209, productId: 0x2882 },
-        { vendorId: 0x1209, productId: 0x2883 },
-        { usagePage: 0xFF00 },
-        { usagePage: 65280 }
-      ];
+  public async connectWebHID(): Promise<boolean> {
+    if (typeof navigator === 'undefined' || !('hid' in navigator)) {
+      throw new Error('Neither native HID nor WebHID is available in this environment.');
+    }
 
-      // First check if already granted
-      let devices: any[] = await (navigator as any).hid.getDevices();
-      let device = devices.find(d => 
-        (d.vendorId === 0x1209) ||
-        (d.collections && d.collections.some((c: any) => c.usagePage === 0xFF00 || c.usagePage === 65280))
-      );
+    const filters = [
+      { usagePage: 0xFF00 },
+      { usagePage: 65280 },
+      { vendorId: 0x1209, productId: 0x2882 },
+      { vendorId: 0x1209, productId: 0x2883 },
+      { vendorId: 0x1209 },
+      { vendorId: 0x2e8a }, // Raspberry Pi Pico
+      { vendorId: 0x046d }, // Logitech
+      { vendorId: 0x12ba }, // RedOctane
+      { vendorId: 0x045e }, // Microsoft
+      { vendorId: 0x054c }  // Sony
+    ];
 
-      // If not previously granted, prompt user / electron
-      if (!device) {
+    let devices: any[] = await (navigator as any).hid.getDevices();
+    let dev = devices.find(d =>
+      (d.vendorId === 0x1209) ||
+      (d.vendorId === 0x2e8a) ||
+      (d.collections && d.collections.some((c: any) => c.usagePage === 0xFF00 || c.usagePage === 65280)) ||
+      (d.productName && /santroller|rp2040|pico|guitar|drum/i.test(d.productName))
+    );
+
+    if (!dev) {
+      try {
         const requested = await (navigator as any).hid.requestDevice({ filters });
         if (requested && requested.length > 0) {
-          device = requested[0];
+          dev = requested[0];
         }
+      } catch (e: any) {
+        this.emitLog(`WebHID filtered request: ${e.message}`);
       }
+    }
 
-      if (!device) {
-        // Fallback: prompt without filters in case of custom vendor/product ID
+    if (!dev) {
+      try {
+        // Broad request if specific filter yielded no selection
         const allRequested = await (navigator as any).hid.requestDevice({ filters: [] });
         if (allRequested && allRequested.length > 0) {
-          device = allRequested[0];
+          dev = allRequested[0];
         }
+      } catch (e: any) {
+        this.emitLog(`WebHID open picker: ${e.message}`);
       }
-
-      if (!device) {
-        this.emitLog('No device selected or found.');
-        return false;
-      }
-
-      this.hidDevice = device;
-      if (!this.hidDevice.opened) {
-        await this.hidDevice.open();
-      }
-
-      this.hidDevice.addEventListener('inputreport', (event: any) => {
-        this.handleInputReport(event);
-      });
-
-      this.connected = true;
-      this.isSimulator = false;
-
-      // Start periodic keepalive
-      this.startKeepalive();
-
-      // Read Version & Board type
-      await this.queryDeviceInfo();
-
-      // Read Configuration
-      await this.readConfigFromDevice();
-
-      this.emitLog(`Successfully connected to: ${this.hidDevice.productName || 'Santroller Device'} (VID: 0x${this.hidDevice.vendorId.toString(16)}, PID: 0x${this.hidDevice.productId.toString(16)})`);
-      return true;
-    } catch (err: any) {
-      this.emitLog(`USB Connection failed: ${err.message}`);
-      throw err;
     }
+
+    if (!dev) {
+      this.emitLog('No Santroller device selected or found.');
+      return false;
+    }
+
+    const webDev = new WebHidDeviceWrapper(dev);
+    await webDev.open();
+    this.device = webDev;
+    return await this.setupDeviceConnection();
+  }
+
+  private async setupDeviceConnection(): Promise<boolean> {
+    if (!this.device) return false;
+
+    this.device.addEventListener('inputreport', (event: any) => {
+      this.handleInputReport(event);
+    });
+
+    this.connected = true;
+    this.isSimulator = false;
+
+    // Start periodic keepalive
+    this.startKeepalive();
+
+    // Read Version & Board type with error guarding
+    try {
+      await this.queryDeviceInfo();
+    } catch (e: any) {
+      this.emitLog(`Device info handshake notice: ${e.message}`);
+    }
+
+    // Read Configuration with error guarding
+    try {
+      await this.readConfigFromDevice();
+    } catch (e: any) {
+      this.emitLog(`Configuration read notice: ${e.message}`);
+    }
+
+    this.emitLog(`Connected to: ${this.device.productName} (Firmware: ${this.deviceVersion} on ${this.deviceBoard})`);
+    return true;
   }
 
   /**
@@ -199,16 +453,16 @@ export class SantrollerDeviceConnection {
       this.keepaliveTimer = null;
     }
 
-    if (this.hidDevice && this.hidDevice.opened) {
+    if (this.device && this.device.opened) {
       try {
         this.sendCommand({ disconnect: {} });
-        this.hidDevice.close();
+        this.device.close();
       } catch (e) {
         // ignore
       }
     }
 
-    this.hidDevice = null;
+    this.device = null;
     this.connected = false;
     this.emitLog('Disconnected from device.');
   }
@@ -218,10 +472,10 @@ export class SantrollerDeviceConnection {
       clearInterval(this.keepaliveTimer);
     }
     this.keepaliveTimer = setInterval(async () => {
-      if (this.connected && this.hidDevice && this.hidDevice.opened) {
+      if (this.connected && this.device && this.device.opened) {
         try {
           const report = new Uint8Array([ReportId.ReportIdKeepalive]);
-          await this.hidDevice.sendFeatureReport(ReportId.ReportIdKeepalive, report);
+          await this.device.sendFeatureReport(ReportId.ReportIdKeepalive, report);
         } catch (e) {
           // ignore keepalive failures
         }
@@ -230,15 +484,15 @@ export class SantrollerDeviceConnection {
   }
 
   private async queryDeviceInfo() {
-    if (!this.hidDevice) return;
+    if (!this.device) return;
     try {
-      const verView = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdGetVersion);
+      const verView = await this.device.receiveFeatureReport(ReportId.ReportIdGetVersion, 64);
       if (verView && verView.byteLength > 1) {
         const dec = new TextDecoder();
         this.deviceVersion = dec.decode(new Uint8Array(verView.buffer, verView.byteOffset + 1, verView.byteLength - 1)).replace(/\0/g, '').trim();
       }
 
-      const typeView = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdGetType);
+      const typeView = await this.device.receiveFeatureReport(ReportId.ReportIdGetType, 64);
       if (typeView && typeView.byteLength > 1) {
         const dec = new TextDecoder();
         this.deviceBoard = dec.decode(new Uint8Array(typeView.buffer, typeView.byteOffset + 1, typeView.byteLength - 1)).replace(/\0/g, '').trim();
@@ -253,12 +507,12 @@ export class SantrollerDeviceConnection {
       return this.config;
     }
 
-    if (!this.hidDevice) return null;
+    if (!this.device) return null;
 
     try {
       this.emitLog('Reading configuration from device EEPROM/Flash...');
-      const infoView = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdConfigInfo);
-      
+      const infoView = await this.device.receiveFeatureReport(ReportId.ReportIdConfigInfo, 64);
+
       let dataSize = 0;
       let mainSize = 0;
       if (infoView && infoView.byteLength > 1) {
@@ -268,7 +522,6 @@ export class SantrollerDeviceConnection {
           dataSize = decodedInfo.dataSize || 0;
           mainSize = decodedInfo.mainSize || 0;
         } catch (e) {
-          // raw struct fallback
           const dv = new DataView(infoView.buffer, infoView.byteOffset + 1);
           dataSize = dv.getInt32(0, true);
         }
@@ -278,7 +531,7 @@ export class SantrollerDeviceConnection {
       let totalBytes = 0;
 
       while (true) {
-        const chunk = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdConfig);
+        const chunk = await this.device.receiveFeatureReport(ReportId.ReportIdConfig, 64);
         if (!chunk || chunk.byteLength <= 1) break;
         const bytes = new Uint8Array(chunk.buffer, chunk.byteOffset + 1, chunk.byteLength - 1);
         chunks.push(bytes);
@@ -324,13 +577,12 @@ export class SantrollerDeviceConnection {
       return true;
     }
 
-    if (!this.hidDevice) return false;
+    if (!this.device) return false;
 
     try {
       this.emitLog('Writing configuration to device...');
       const encoded = proto.Config.encode(cfg).finish();
 
-      // Send Info report first
       const infoMsg = proto.ConfigInfo.create({
         dataSize: encoded.length,
         mainSize: encoded.length,
@@ -343,22 +595,20 @@ export class SantrollerDeviceConnection {
       const infoReport = new Uint8Array(64);
       infoReport[0] = ReportId.ReportIdConfigInfo;
       infoReport.set(encodedInfo, 1);
-      await this.hidDevice.sendFeatureReport(ReportId.ReportIdConfigInfo, infoReport);
+      await this.device.sendFeatureReport(ReportId.ReportIdConfigInfo, infoReport);
 
-      // Send chunks of 63 bytes
       let offset = 0;
       while (offset < encoded.length) {
         const chunkLen = Math.min(63, encoded.length - offset);
         const chunk = new Uint8Array(64);
         chunk[0] = ReportId.ReportIdConfig;
         chunk.set(encoded.subarray(offset, offset + chunkLen), 1);
-        await this.hidDevice.sendFeatureReport(ReportId.ReportIdConfig, chunk);
+        await this.device.sendFeatureReport(ReportId.ReportIdConfig, chunk);
         offset += chunkLen;
       }
 
-      // Send Loaded report
       const loadedReport = new Uint8Array([ReportId.ReportIdLoaded, 1]);
-      await this.hidDevice.sendFeatureReport(ReportId.ReportIdLoaded, loadedReport);
+      await this.device.sendFeatureReport(ReportId.ReportIdLoaded, loadedReport);
 
       this.emitLog('Configuration successfully uploaded to device flash!');
       return true;
@@ -382,7 +632,7 @@ export class SantrollerDeviceConnection {
       return true;
     }
 
-    if (!this.hidDevice) return false;
+    if (!this.device) return false;
 
     try {
       const commandMsg = proto.Command.create(cmd);
@@ -390,7 +640,7 @@ export class SantrollerDeviceConnection {
       const report = new Uint8Array(64);
       report[0] = ReportId.ReportIdCommand;
       report.set(encoded, 1);
-      await this.hidDevice.sendFeatureReport(ReportId.ReportIdCommand, report);
+      await this.device.sendFeatureReport(ReportId.ReportIdCommand, report);
       return true;
     } catch (err: any) {
       this.emitLog(`Command error: ${err.message}`);
@@ -403,10 +653,10 @@ export class SantrollerDeviceConnection {
       this.emitLog('Simulator: Rebooting to bootloader...');
       return true;
     }
-    if (!this.hidDevice) return false;
+    if (!this.device) return false;
     try {
       const report = new Uint8Array([ReportId.ReportIdBootloader, 1]);
-      await this.hidDevice.sendFeatureReport(ReportId.ReportIdBootloader, report);
+      await this.device.sendFeatureReport(ReportId.ReportIdBootloader, report);
       this.emitLog('Device rebooted to BOOTSEL / bootloader.');
       return true;
     } catch (e: any) {

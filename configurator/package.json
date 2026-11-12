@@ -18,15 +18,21 @@
     "build:win": "vite build && electron-builder --win portable zip --x64"
   },
   "build": {
+    "npmRebuild": false,
     "appId": "net.tangentmc.santroller.configurator",
     "productName": "Santroller Configurator",
     "directories": {
       "output": "dist-electron"
     },
+    "asarUnpack": [
+      "**/*.node"
+    ],
     "files": [
       "dist/**/*",
       "electron-main.js",
-      "package.json"
+      "package.json",
+      "node_modules/node-hid/**/*",
+      "node_modules/pkg-prebuilds/**/*"
     ],
     "win": {
       "target": [
@@ -63,5 +69,8 @@
     "tailwindcss": "^3.4.19",
     "typescript": "^7.0.2",
     "vite": "^8.3.7"
+  },
+  "dependencies": {
+    "node-hid": "^3.4.0"
   }
 }
