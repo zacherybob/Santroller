@@ -18,14 +18,7 @@ export enum ReportId {
   ReportIdUpdateFirmware = 0x30,
   ReportIdUploadFirmware = 0x31,
   ReportIdGetType = 0x32,
-}
-
-export interface ConfigInfo {
-  dataSize: number;
-  dataCrc: number;
-  mainSize: number;
-  auxSize: number;
-  magic: number;
+  ReportIdConfigInfoSaved = 0x33,
 }
 
 export type EventCallback = (event: proto.IEvent) => void;
@@ -33,7 +26,7 @@ export type LogCallback = (line: string) => void;
 
 /**
  * SantrollerDeviceConnection manages communication with a Santroller device
- * either via WebHID in the browser / Electron or through a Mock/Simulator backend.
+ * via WebHID or through a Mock/Simulator backend.
  */
 export class SantrollerDeviceConnection {
   private hidDevice: any = null;
@@ -48,6 +41,7 @@ export class SantrollerDeviceConnection {
 
   constructor() {
     this.createDefaultConfig();
+    this.listenDeviceChanges();
   }
 
   public isConnected(): boolean {
@@ -94,26 +88,70 @@ export class SantrollerDeviceConnection {
     }
   }
 
+  private listenDeviceChanges() {
+    if (typeof navigator !== 'undefined' && 'hid' in navigator) {
+      (navigator as any).hid.addEventListener('disconnect', (e: any) => {
+        if (this.hidDevice === e.device) {
+          this.emitLog(`Device disconnected: ${e.device?.productName || 'Santroller'}`);
+          this.disconnect();
+        }
+      });
+    }
+  }
+
   /**
    * Connect via WebHID (Available in Chrome / Edge / Electron)
    */
   public async connectWebHID(): Promise<boolean> {
     try {
       if (!('hid' in navigator)) {
-        throw new Error('WebHID is not supported in this browser/environment.');
+        throw new Error('WebHID is not supported in this environment.');
       }
 
-      // Request device with vendor/usage matching Santroller
-      const devices = await (navigator as any).hid.requestDevice({
-        filters: []
-      });
+      this.emitLog('Scanning for connected Santroller devices...');
 
-      if (!devices || devices.length === 0) {
+      // Filters matching official Santroller firmware VIDs, PIDs and Vendor UsagePage
+      const filters = [
+        { vendorId: 0x1209, productId: 0x2882, usagePage: 0xFF00 },
+        { vendorId: 0x1209, productId: 0x2883, usagePage: 0xFF00 },
+        { vendorId: 0x1209, productId: 0x2882 },
+        { vendorId: 0x1209, productId: 0x2883 },
+        { usagePage: 0xFF00 },
+        { usagePage: 65280 }
+      ];
+
+      // First check if already granted
+      let devices: any[] = await (navigator as any).hid.getDevices();
+      let device = devices.find(d => 
+        (d.vendorId === 0x1209) ||
+        (d.collections && d.collections.some((c: any) => c.usagePage === 0xFF00 || c.usagePage === 65280))
+      );
+
+      // If not previously granted, prompt user / electron
+      if (!device) {
+        const requested = await (navigator as any).hid.requestDevice({ filters });
+        if (requested && requested.length > 0) {
+          device = requested[0];
+        }
+      }
+
+      if (!device) {
+        // Fallback: prompt without filters in case of custom vendor/product ID
+        const allRequested = await (navigator as any).hid.requestDevice({ filters: [] });
+        if (allRequested && allRequested.length > 0) {
+          device = allRequested[0];
+        }
+      }
+
+      if (!device) {
+        this.emitLog('No device selected or found.');
         return false;
       }
 
-      this.hidDevice = devices[0];
-      await this.hidDevice.open();
+      this.hidDevice = device;
+      if (!this.hidDevice.opened) {
+        await this.hidDevice.open();
+      }
 
       this.hidDevice.addEventListener('inputreport', (event: any) => {
         this.handleInputReport(event);
@@ -122,18 +160,19 @@ export class SantrollerDeviceConnection {
       this.connected = true;
       this.isSimulator = false;
 
-      // Start keepalive
+      // Start periodic keepalive
       this.startKeepalive();
 
-      // Read Version & Type
+      // Read Version & Board type
       await this.queryDeviceInfo();
-      // Read Config
+
+      // Read Configuration
       await this.readConfigFromDevice();
 
-      this.emitLog(`Connected to USB device: ${this.hidDevice.productName}`);
+      this.emitLog(`Successfully connected to: ${this.hidDevice.productName || 'Santroller Device'} (VID: 0x${this.hidDevice.vendorId.toString(16)}, PID: 0x${this.hidDevice.productId.toString(16)})`);
       return true;
     } catch (err: any) {
-      this.emitLog(`WebHID connection failed: ${err.message}`);
+      this.emitLog(`USB Connection failed: ${err.message}`);
       throw err;
     }
   }
@@ -150,7 +189,6 @@ export class SantrollerDeviceConnection {
     this.emitLog('Connected to virtual Santroller simulator.');
     this.emitLog('Firmware: ' + this.deviceVersion + ' on ' + this.deviceBoard);
 
-    // Simulate periodic heartbeat / mock events
     this.startSimulatorEvents();
     return true;
   }
@@ -176,6 +214,9 @@ export class SantrollerDeviceConnection {
   }
 
   private startKeepalive() {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+    }
     this.keepaliveTimer = setInterval(async () => {
       if (this.connected && this.hidDevice && this.hidDevice.opened) {
         try {
@@ -185,18 +226,23 @@ export class SantrollerDeviceConnection {
           // ignore keepalive failures
         }
       }
-    }, 500);
+    }, 400);
   }
 
   private async queryDeviceInfo() {
     if (!this.hidDevice) return;
     try {
       const verView = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdGetVersion);
-      const dec = new TextDecoder();
-      this.deviceVersion = dec.decode(verView.buffer).replace(/\0/g, '').trim();
+      if (verView && verView.byteLength > 1) {
+        const dec = new TextDecoder();
+        this.deviceVersion = dec.decode(new Uint8Array(verView.buffer, verView.byteOffset + 1, verView.byteLength - 1)).replace(/\0/g, '').trim();
+      }
 
       const typeView = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdGetType);
-      this.deviceBoard = dec.decode(typeView.buffer).replace(/\0/g, '').trim();
+      if (typeView && typeView.byteLength > 1) {
+        const dec = new TextDecoder();
+        this.deviceBoard = dec.decode(new Uint8Array(typeView.buffer, typeView.byteOffset + 1, typeView.byteLength - 1)).replace(/\0/g, '').trim();
+      }
     } catch (e) {
       console.warn('Failed to query device info', e);
     }
@@ -210,10 +256,24 @@ export class SantrollerDeviceConnection {
     if (!this.hidDevice) return null;
 
     try {
-      this.emitLog('Reading configuration from device...');
-      // 1. Fetch info
+      this.emitLog('Reading configuration from device EEPROM/Flash...');
       const infoView = await this.hidDevice.receiveFeatureReport(ReportId.ReportIdConfigInfo);
-      // parse config info struct or length
+      
+      let dataSize = 0;
+      let mainSize = 0;
+      if (infoView && infoView.byteLength > 1) {
+        try {
+          const rawBytes = new Uint8Array(infoView.buffer, infoView.byteOffset + 1, infoView.byteLength - 1);
+          const decodedInfo = proto.ConfigInfo.decode(rawBytes);
+          dataSize = decodedInfo.dataSize || 0;
+          mainSize = decodedInfo.mainSize || 0;
+        } catch (e) {
+          // raw struct fallback
+          const dv = new DataView(infoView.buffer, infoView.byteOffset + 1);
+          dataSize = dv.getInt32(0, true);
+        }
+      }
+
       const chunks: Uint8Array[] = [];
       let totalBytes = 0;
 
@@ -223,8 +283,11 @@ export class SantrollerDeviceConnection {
         const bytes = new Uint8Array(chunk.buffer, chunk.byteOffset + 1, chunk.byteLength - 1);
         chunks.push(bytes);
         totalBytes += bytes.length;
+        if (dataSize > 0 && totalBytes >= dataSize) {
+          break;
+        }
         if (bytes.length < 63) {
-          break; // Last chunk
+          break;
         }
       }
 
@@ -236,9 +299,14 @@ export class SantrollerDeviceConnection {
           offset += c.length;
         }
 
-        // Decode protobuf
-        this.config = proto.Config.decodeDelimited(fullBuf);
-        this.emitLog(`Loaded configuration (${totalBytes} bytes, ${this.config.profiles?.length || 0} profiles).`);
+        const sizeToDecode = mainSize > 0 ? mainSize : totalBytes;
+        try {
+          this.config = proto.Config.decode(fullBuf.subarray(0, sizeToDecode));
+        } catch {
+          this.config = proto.Config.decodeDelimited(fullBuf);
+        }
+
+        this.emitLog(`Configuration loaded (${totalBytes} bytes, ${this.config.profiles?.length || 0} profiles).`);
         return this.config;
       }
     } catch (err: any) {
@@ -260,12 +328,21 @@ export class SantrollerDeviceConnection {
 
     try {
       this.emitLog('Writing configuration to device...');
-      const encoded = proto.Config.encodeDelimited(cfg).finish();
+      const encoded = proto.Config.encode(cfg).finish();
 
       // Send Info report first
+      const infoMsg = proto.ConfigInfo.create({
+        dataSize: encoded.length,
+        mainSize: encoded.length,
+        auxSize: 0,
+        dataCrc: 0,
+        magic: 0x434F4E46
+      });
+      const encodedInfo = proto.ConfigInfo.encode(infoMsg).finish();
+
       const infoReport = new Uint8Array(64);
       infoReport[0] = ReportId.ReportIdConfigInfo;
-      // encode sizes
+      infoReport.set(encodedInfo, 1);
       await this.hidDevice.sendFeatureReport(ReportId.ReportIdConfigInfo, infoReport);
 
       // Send chunks of 63 bytes
@@ -344,7 +421,6 @@ export class SantrollerDeviceConnection {
 
     try {
       const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      // Decode EventList protobuf
       const eventList = proto.EventList.decodeDelimited(uint8);
       if (eventList && eventList.event) {
         for (const evt of eventList.event) {
@@ -355,12 +431,11 @@ export class SantrollerDeviceConnection {
         }
       }
     } catch (e) {
-      // not a protobuf report or raw event
+      // not a protobuf report
     }
   }
 
   private startSimulatorEvents() {
-    // Generate mock button / axis telemetry occasionally for testing
     let toggle = false;
     setInterval(() => {
       if (!this.isSimulator || !this.connected) return;
